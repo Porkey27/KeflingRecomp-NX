@@ -1,175 +1,275 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Main UI controller for the KeflingRecomp-NX installer.
+// KeflingRecomp-NX installer — main UI controller (SA2-NX style)
 
-'use strict';
-
-import { t, setLanguage, LANGUAGES } from './lib/i18n.js';
+import { t, setLanguage, LANGS, applyStrings } from './lib/i18n.js';
+import { identifyGame, identifyDlc, TITLE_ID }  from './lib/installer.js';
 
 // ── DOM helpers ───────────────────────────────────────────────────────────────
 const $  = id => document.getElementById(id);
-const qs = s  => document.querySelector(s);
 
 // ── State ─────────────────────────────────────────────────────────────────────
-let _source    = null;   // { kind: 'folder'|'iso', file?, entries? }
-let _worker    = null;
-let _swReady   = false;
+// Raw File objects are stored (structured-cloneable for postMessage to worker).
+// FileDescriptors (with read()) are created on the fly for in-thread use.
+let _rawGameFiles = null;   // { path: string, file: File }[]
+let _dlcPacks     = [];     // { slug, name, raw: { path, file }[] }[]
+let _identified   = false;
+let _swReady      = false;
+let _worker       = null;
 
-// ── Service Worker registration ───────────────────────────────────────────────
-async function ensureSW() {
-    if (!('serviceWorker' in navigator)) return false;
-    const reg = await navigator.serviceWorker.register('./sw.js', { scope: './' });
-    await navigator.serviceWorker.ready;
-    _swReady = true;
-    return true;
+// ── FileDescriptor from browser File ─────────────────────────────────────────
+function makeDescriptor({ path, file }) {
+    return {
+        path,
+        size: file.size,
+        read(offset, length) {
+            return file.slice(offset, offset + length)
+                       .arrayBuffer().then(ab => new Uint8Array(ab));
+        },
+    };
 }
 
-// ── Localisation ──────────────────────────────────────────────────────────────
-function applyStrings() {
-    document.querySelectorAll('[data-i18n]').forEach(el => {
-        const key = el.dataset.i18n;
-        el.innerHTML = t(key);
-    });
-    document.title = t('title');
+function rawFromInput(input) {
+    return Array.from(input.files).map(f => ({
+        path: f.webkitRelativePath || f.name,
+        file: f,
+    }));
 }
+
+// ── Language switcher ─────────────────────────────────────────────────────────
+const FLAG_SVGS = {
+    en: `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 60 40">
+           <rect width="60" height="40" fill="#012169"/>
+           <path d="M0,0 L60,40 M60,0 L0,40" stroke="#fff" stroke-width="8"/>
+           <path d="M0,0 L60,40 M60,0 L0,40" stroke="#C8102E" stroke-width="5"/>
+           <path d="M30,0 V40 M0,20 H60" stroke="#fff" stroke-width="12"/>
+           <path d="M30,0 V40 M0,20 H60" stroke="#C8102E" stroke-width="8"/>
+         </svg>`,
+    es: `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 60 40">
+           <rect width="60" height="40" fill="#c60b1e"/>
+           <rect y="10" width="60" height="20" fill="#ffc400"/>
+         </svg>`,
+    fr: `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 60 40">
+           <rect width="20" height="40" fill="#002395"/>
+           <rect x="20" width="20" height="40" fill="#fff"/>
+           <rect x="40" width="20" height="40" fill="#ED2939"/>
+         </svg>`,
+    de: `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 60 40">
+           <rect width="60" height="40" fill="#000"/>
+           <rect y="13.3" width="60" height="13.4" fill="#DD0000"/>
+           <rect y="26.7" width="60" height="13.3" fill="#FFCE00"/>
+         </svg>`,
+    ja: `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 60 40">
+           <rect width="60" height="40" fill="#fff"/>
+           <circle cx="30" cy="20" r="12" fill="#BC002D"/>
+         </svg>`,
+};
 
 function buildLangSwitcher() {
-    const wrap = $('lang-switcher');
-    if (!wrap) return;
-    wrap.innerHTML = '';
-    for (const [code, label] of Object.entries(LANGUAGES)) {
+    const nav = $('languages');
+    if (!nav) return;
+    nav.innerHTML = '';
+    const current = t.__lang ?? 'en';
+    for (const [code, label] of Object.entries(LANGS)) {
         const btn = document.createElement('button');
-        btn.textContent = label;
-        btn.dataset.lang = code;
+        btn.setAttribute('aria-label', label);
+        btn.setAttribute('title', label);
+        btn.setAttribute('aria-pressed', code === current ? 'true' : 'false');
+        btn.innerHTML = FLAG_SVGS[code] ?? `<svg viewBox="0 0 60 40"><rect width="60" height="40" fill="#555"/></svg>`;
         btn.addEventListener('click', () => {
             setLanguage(code);
             applyStrings();
             buildLangSwitcher();
         });
-        wrap.appendChild(btn);
+        nav.appendChild(btn);
     }
 }
 
-// ── File picker — folder ──────────────────────────────────────────────────────
-function setupFolderPicker() {
-    const input = $('folder-input');
-    if (!input) return;
-    input.setAttribute('webkitdirectory', '');
-    input.setAttribute('multiple', '');
-    input.addEventListener('change', () => {
-        if (!input.files?.length) return;
-        // Convert FileList to descriptor array
-        const entries = Array.from(input.files).map(file => ({
-            isDirectory: false,
-            isFile:      true,
-            name:        file.name,
-            file(cb)    { cb(file); },
-        }));
-        // Reconstruct paths from webkitRelativePath
-        const fileDescriptors = Array.from(input.files).map(file => ({
-            path: file.webkitRelativePath || file.name,
-            size: file.size,
-            read(offset, length) {
-                const slice = file.slice(offset, offset + length);
-                return slice.arrayBuffer().then(ab => new Uint8Array(ab));
-            },
-        }));
-        _source = { kind: 'folder', fileDescriptors };
-        setStatus('status_reading');
-        startIdentify();
-    });
+// ── Detected box ──────────────────────────────────────────────────────────────
+function showDetected(good, status, detail, fingerprint) {
+    const box = $('detected');
+    if (!box) return;
+    box.hidden = false;
+    box.classList.toggle('good', good);
+    box.classList.toggle('bad',  !good);
+    const st = $('det-status');
+    const dt = $('det-detail');
+    const fp = $('det-fingerprint');
+    if (st) st.textContent = status;
+    if (dt) dt.textContent = detail;
+    if (fp) {
+        if (fingerprint) { fp.textContent = fingerprint; fp.hidden = false; }
+        else { fp.hidden = true; }
+    }
 }
 
-// ── File picker — ISO ─────────────────────────────────────────────────────────
-function setupIsoPicker() {
-    const input = $('iso-input');
-    if (!input) return;
-    input.accept = '.iso,.xiso';
-    input.addEventListener('change', () => {
-        const file = input.files?.[0];
-        if (!file) return;
-        _source = { kind: 'iso', file };
-        setStatus('status_reading');
-        startIdentify();
-    });
+function hideDetected() {
+    const box = $('detected');
+    if (box) { box.hidden = true; box.className = 'detected'; }
 }
 
-// ── Status / log display ──────────────────────────────────────────────────────
-function setStatus(key) {
-    const el = $('status-text');
-    if (el) el.innerHTML = t(key);
+// ── Game file pickers ─────────────────────────────────────────────────────────
+function setupGamePickers() {
+    const pkg    = $('package');
+    const folder = $('folder');
+    if (!pkg && !folder) return;
+
+    async function handleFiles(rawFiles) {
+        if (!rawFiles.length) return;
+        _rawGameFiles = rawFiles;
+        _identified   = false;
+        $('create').disabled = true;
+        $('update').disabled = true;
+        hideDetected();
+        clearLog();
+
+        const names   = rawFiles.map(r => r.path.split('/').pop()).join(', ');
+        const chosen  = $('chosen');
+        if (chosen) chosen.textContent = names.length > 60 ? names.slice(0, 57) + '…' : names;
+
+        log(t('status_reading'));
+        try {
+            const fds  = rawFiles.map(makeDescriptor);
+            const info = await identifyGame(fds);
+            _identified = true;
+            showDetected(
+                true,
+                t('status_identified'),
+                info.displayName ?? 'A World of Keflings',
+                `Title ID: ${info.titleId ?? TITLE_ID}`
+            );
+            $('create').disabled = false;
+            $('update').disabled = false;
+            log(t('status_identified'));
+        } catch (err) {
+            const msg = err.code ? (t(err.code) || err.message) : err.message;
+            showDetected(false, t('err_identify'), msg);
+            log('✗ ' + msg);
+        }
+    }
+
+    if (pkg) {
+        pkg.addEventListener('change', () => {
+            if (!pkg.files?.length) return;
+            handleFiles(rawFromInput(pkg));
+            pkg.value = '';
+        });
+    }
+    if (folder) {
+        folder.addEventListener('change', () => {
+            if (!folder.files?.length) return;
+            handleFiles(rawFromInput(folder));
+            folder.value = '';
+        });
+    }
 }
 
-function appendLog(msg) {
-    const el = $('build-log');
+// ── DLC pickers ───────────────────────────────────────────────────────────────
+function setupDlcPickers() {
+    const pkg    = $('dlc-package');
+    const folder = $('dlc-folder');
+
+    async function addDlcFiles(rawFiles) {
+        if (!rawFiles.length) return;
+        log(t('dlc_reading'));
+        try {
+            const fds  = rawFiles.map(makeDescriptor);
+            const info = await identifyDlc(fds);
+            if (_dlcPacks.find(p => p.slug === info.slug)) {
+                log(`⚠ ${info.name} already added`);
+                return;
+            }
+            _dlcPacks.push({ slug: info.slug, name: info.name, raw: rawFiles });
+            renderDlcList();
+            log(`✓ DLC: ${info.name}`);
+        } catch (err) {
+            const msg = err.code ? (t(err.code) || err.message) : err.message;
+            log('✗ DLC: ' + msg);
+        }
+    }
+
+    if (pkg) {
+        pkg.addEventListener('change', () => {
+            if (!pkg.files?.length) return;
+            addDlcFiles(rawFromInput(pkg));
+            pkg.value = '';
+        });
+    }
+    if (folder) {
+        folder.addEventListener('change', () => {
+            if (!folder.files?.length) return;
+            addDlcFiles(rawFromInput(folder));
+            folder.value = '';
+        });
+    }
+}
+
+function renderDlcList() {
+    const container = $('dlc-packs');
+    if (!container) return;
+    container.innerHTML = '';
+    for (let i = 0; i < _dlcPacks.length; i++) {
+        const pack = _dlcPacks[i];
+        const row = document.createElement('div');
+        row.className = 'dlc-pack good';
+        row.innerHTML = `
+          <div style="flex:1">
+            <div class="dlc-name">${escHtml(pack.name)}</div>
+            <div class="dlc-sub">${escHtml(pack.slug)}</div>
+          </div>
+          <button class="remove" aria-label="Remove">✕</button>`;
+        row.querySelector('.remove').addEventListener('click', () => {
+            _dlcPacks.splice(i, 1);
+            renderDlcList();
+        });
+        container.appendChild(row);
+    }
+}
+
+// ── Progress / log ────────────────────────────────────────────────────────────
+function setProgress(ratio, show = true) {
+    const bar = $('bar');
+    if (!bar) return;
+    bar.hidden  = !show;
+    bar.value   = Math.min(1, Math.max(0, ratio));
+}
+
+function log(msg, error = false) {
+    const el = $('log');
     if (!el) return;
     const line = document.createElement('div');
+    if (error) line.className = 'error';
     line.textContent = msg;
     el.appendChild(line);
     el.scrollTop = el.scrollHeight;
 }
 
-function setProgress(ratio) {
-    const bar = $('progress-bar');
-    if (bar) bar.style.width = `${Math.min(1, ratio) * 100}%`;
+function clearLog() {
+    const el = $('log');
+    if (el) el.innerHTML = '';
 }
 
-function showError(msg) {
-    const el = $('error-box');
-    if (!el) return;
-    el.innerHTML = msg;
-    el.hidden = false;
+// ── Service Worker ────────────────────────────────────────────────────────────
+async function ensureSW() {
+    if (_swReady) return true;
+    if (!('serviceWorker' in navigator)) return false;
+    await navigator.serviceWorker.register('./sw.js', { scope: './' });
+    await navigator.serviceWorker.ready;
+    _swReady = true;
+    return true;
 }
 
-function hideError() {
-    const el = $('error-box');
-    if (el) el.hidden = true;
-}
-
-function showInfo(xexHash, version, size) {
-    const el = $('game-info');
-    if (!el) return;
-    el.hidden = false;
-    const hEl = $('info-hash');
-    const vEl = $('info-version');
-    const sEl = $('info-size');
-    if (hEl) hEl.textContent = t('info_hash') + xexHash.slice(0, 16) + '…';
-    if (vEl) vEl.textContent = t('info_version') + version;
-    if (sEl && size) sEl.textContent = t('info_size') + size;
-}
-
-// ── Identification (quick pre-check before full build) ────────────────────────
-async function startIdentify() {
-    // We do identification inside the worker to keep the UI thread free.
-    // Show the build panel once the source is set.
-    const buildPanel = $('build-panel');
-    if (buildPanel) buildPanel.hidden = false;
-    hideError();
-    setProgress(0);
-}
-
-// ── Trigger the browser download via Service Worker ───────────────────────────
 function triggerDownload(filename, totalSize) {
     return new Promise((resolve, reject) => {
-        const channel = new MessageChannel();
         const sw = navigator.serviceWorker.controller;
         if (!sw) { reject(new Error('no SW controller')); return; }
-
-        channel.port1.onmessage = msg => {
-            if (msg.data.type === 'READY') resolve(channel.port2);
-        };
-
-        sw.postMessage({
-            type:      'PREPARE_DOWNLOAD',
-            filename,
-            totalSize,
-            port:      channel.port1,
-        }, [channel.port1]);
-
-        // Create an invisible <a> and click it
-        const a    = document.createElement('a');
-        a.href     = './keflings-download-stream';
-        a.download = filename;
-        a.style.display = 'none';
+        const ch = new MessageChannel();
+        ch.port1.onmessage = e => { if (e.data.type === 'READY') resolve(ch.port2); };
+        sw.postMessage({ type: 'PREPARE_DOWNLOAD', filename, totalSize, port: ch.port1 }, [ch.port1]);
+        const a = Object.assign(document.createElement('a'), {
+            href: './keflings-download-stream',
+            download: filename,
+            style: 'display:none',
+        });
         document.body.appendChild(a);
         a.click();
         document.body.removeChild(a);
@@ -178,121 +278,85 @@ function triggerDownload(filename, totalSize) {
 
 // ── Build ─────────────────────────────────────────────────────────────────────
 async function startBuild(onlyUpdate) {
-    if (!_source) return;
-    if (!_swReady) {
-        const ok = await ensureSW();
-        if (!ok) {
-            showError('Service workers are not supported in this browser. Please use Chrome or Firefox.');
-            return;
-        }
+    if (!_identified || !_gameFiles) return;
+
+    const btnCreate = $('create');
+    const btnUpdate = $('update');
+    if (btnCreate) btnCreate.disabled = true;
+    if (btnUpdate) btnUpdate.disabled = true;
+
+    if (!await ensureSW()) {
+        log('✗ Service workers required. Use Chrome or Firefox.', true);
+        if (btnCreate) btnCreate.disabled = false;
+        if (btnUpdate) btnUpdate.disabled = false;
+        return;
     }
 
-    const buildBtn  = $('btn-build');
-    const updateBtn = $('btn-update');
-    if (buildBtn)  buildBtn.disabled  = true;
-    if (updateBtn) updateBtn.disabled = true;
-
-    hideError();
-    setStatus('status_building');
-    setProgress(0);
-    const log = $('build-log');
-    if (log) log.innerHTML = '';
-
-    // Terminate any previous worker
+    clearLog();
+    setProgress(0, true);
     if (_worker) { _worker.terminate(); _worker = null; }
 
     _worker = new Worker('./worker.js', { type: 'module' });
 
-    // Wire SW port
-    const swChannel = new MessageChannel();
-    // port1 → worker, port2 → SW (sent later)
-    let swPort2 = null;
-
-    _worker.onmessage = async msg => {
-        const { type } = msg.data;
-
-        if (type === 'log')      { appendLog(msg.data.msg); }
-        if (type === 'progress') { setProgress(msg.data.ratio); }
-        if (type === 'status')   { setStatus(msg.data.key); }
-        if (type === 'error')    {
-            showError(msg.data.msg);
-            if (buildBtn)  buildBtn.disabled  = false;
-            if (updateBtn) updateBtn.disabled = false;
+    _worker.onmessage = async e => {
+        const { type } = e.data;
+        if (type === 'log')      log(e.data.msg);
+        if (type === 'progress') setProgress(e.data.ratio);
+        if (type === 'error') {
+            log('✗ ' + e.data.msg, true);
+            setProgress(0, false);
+            if (btnCreate) btnCreate.disabled = false;
+            if (btnUpdate) btnUpdate.disabled = false;
         }
         if (type === 'size') {
-            const { bytes, human } = msg.data;
-            const sEl = $('info-size');
-            if (sEl) sEl.textContent = t('info_size') + human;
-            // Now we know the size — register the download stream with the SW
             try {
-                swPort2 = await triggerDownload('keflings-nx.zip', bytes);
-                // Forward swPort2 to the worker so it can send chunks
-                _worker.postMessage({ type: 'sw_port', port: swPort2 }, [swPort2]);
-            } catch (e) {
-                showError(`Failed to set up download: ${e.message}`);
+                const filename = onlyUpdate ? 'keflings-nx-update.zip' : 'keflings-nx.zip';
+                const port2 = await triggerDownload(filename, e.data.bytes);
+                _worker.postMessage({ type: 'sw_port', port: port2 }, [port2]);
+                log(`→ Streaming ${e.data.human}…`);
+            } catch (err) {
+                log('✗ Download setup failed: ' + err.message, true);
             }
-        }
-        if (type === 'identified') {
-            const { xexHash, version, complete } = msg.data;
-            showInfo(xexHash, version, null);
-            if (!complete) appendLog('Warning: some files may be missing.');
         }
         if (type === 'done') {
             setProgress(1);
-            setStatus('status_done');
-            if (buildBtn)  buildBtn.disabled  = false;
-            if (updateBtn) updateBtn.disabled = false;
+            log('✓ ' + t('status_done'));
+            if (btnCreate) btnCreate.disabled = false;
+            if (btnUpdate) btnUpdate.disabled = false;
         }
     };
 
     _worker.onerror = err => {
-        showError(`Worker error: ${err.message}`);
-        if (buildBtn)  buildBtn.disabled  = false;
-        if (updateBtn) updateBtn.disabled = false;
+        log('✗ Worker: ' + err.message, true);
+        setProgress(0, false);
+        if (btnCreate) btnCreate.disabled = false;
+        if (btnUpdate) btnUpdate.disabled = false;
     };
 
-    // Source data to pass to the worker
-    // For 'folder' source: pass fileDescriptors directly (they hold File refs)
-    // For 'iso' source: pass the File object
-    const workerSource = _source.kind === 'iso'
-        ? { kind: 'iso', file: _source.file }
-        : { kind: 'folder', fileDescriptors: _source.fileDescriptors };
+    // Pass raw File objects (structured-cloneable); worker wraps them into FDs.
+    _worker.postMessage({
+        source:     { kind: 'files', raw: _rawGameFiles },
+        dlcSources: _dlcPacks.map(p => ({ slug: p.slug, name: p.name, raw: p.raw })),
+        onlyUpdate,
+    });
+}
 
-    // We use a two-phase approach:
-    //  1. Worker sends 'size' message → main thread sets up SW → sends port back
-    //  2. Worker then streams chunks through that port
-    // So we DON'T send swPort1 upfront; worker waits for 'sw_port' message.
-    _worker.postMessage({ source: workerSource, onlyUpdate });
+// ── Utilities ─────────────────────────────────────────────────────────────────
+function escHtml(s) {
+    return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
 
 // ── Init ──────────────────────────────────────────────────────────────────────
-document.addEventListener('DOMContentLoaded', async () => {
-    // Language switcher
+document.addEventListener('DOMContentLoaded', () => {
     buildLangSwitcher();
     applyStrings();
+    setupGamePickers();
+    setupDlcPickers();
 
-    // File pickers
-    setupFolderPicker();
-    setupIsoPicker();
+    const btnCreate = $('create');
+    const btnUpdate = $('update');
+    if (btnCreate) btnCreate.addEventListener('click', () => startBuild(false));
+    if (btnUpdate) btnUpdate.addEventListener('click', () => startBuild(true));
 
-    // Build buttons
-    const buildBtn  = $('btn-build');
-    const updateBtn = $('btn-update');
-    if (buildBtn)  buildBtn.addEventListener('click',  () => startBuild(false));
-    if (updateBtn) updateBtn.addEventListener('click',  () => startBuild(true));
-
-    // Folder picker button (label click proxy)
-    const folderBtn = $('btn-select-folder');
-    if (folderBtn) {
-        folderBtn.addEventListener('click', () => $('folder-input')?.click());
-        folderBtn.innerHTML = t('btn_select_folder');
-    }
-    const isoBtn = $('btn-select-iso');
-    if (isoBtn) {
-        isoBtn.addEventListener('click', () => $('iso-input')?.click());
-        isoBtn.innerHTML = t('btn_select_iso');
-    }
-
-    // Pre-register SW
     ensureSW().catch(() => {});
 });

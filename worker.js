@@ -1,87 +1,80 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Web Worker — runs in the background thread.
-// Receives a build request from app.js, identifies the game, downloads the NRO,
-// builds the ZIP via createPackage(), and streams chunks back through a
-// MessageChannel port wired to the Service Worker.
+// Receives a build request from app.js (raw File objects, not FileDescriptors),
+// wraps them, identifies the game, downloads the NRO, builds the ZIP, and
+// streams chunks back via a MessageChannel port wired to the Service Worker.
 
 'use strict';
 
-import { listIsoFiles }                             from './lib/iso.js';
-import { identifyGame, rootAtExecutable, programPath, createPackage, TITLE_ID } from './lib/installer.js';
-import { formatBytes }                              from './lib/i18n.js';
+import { listIsoFiles }                from './lib/iso.js';
+import {
+    identifyGame, identifyDlc,
+    rootAtExecutable, programPath,
+    createPackage, TITLE_ID,
+} from './lib/installer.js';
+import { formatBytes }                 from './lib/i18n.js';
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
-function log(msg)          { self.postMessage({ type: 'log',      msg }); }
-function progress(ratio)   { self.postMessage({ type: 'progress', ratio }); }
-function error(msg, code)  { self.postMessage({ type: 'error',    msg, code }); }
-function done()            { self.postMessage({ type: 'done' }); }
+function log(msg)        { self.postMessage({ type: 'log',      msg }); }
+function progress(ratio) { self.postMessage({ type: 'progress', ratio }); }
+function error(msg, code){ self.postMessage({ type: 'error',    msg, code }); }
+function done()          { self.postMessage({ type: 'done' }); }
 
-async function fetchText(url) {
+async function fetchText(url)  {
     const r = await fetch(url);
-    if (!r.ok) throw new Error(`HTTP ${r.status} fetching ${url}`);
+    if (!r.ok) throw new Error(`HTTP ${r.status}: ${url}`);
     return r.text();
 }
 async function fetchBytes(url) {
     const r = await fetch(url);
-    if (!r.ok) throw new Error(`HTTP ${r.status} fetching ${url}`);
+    if (!r.ok) throw new Error(`HTTP ${r.status}: ${url}`);
     return new Uint8Array(await r.arrayBuffer());
 }
-async function fetchJSON(url) {
+async function fetchJSON(url)  {
     const r = await fetch(url, { cache: 'no-store' });
-    if (!r.ok) throw new Error(`HTTP ${r.status} fetching ${url}`);
+    if (!r.ok) throw new Error(`HTTP ${r.status}: ${url}`);
     return r.json();
 }
 
-// ── Build from folder FileSystemEntry list ────────────────────────────────────
-function wrapEntry(entry, fullPath) {
-    // entry is a FileSystemFileEntry
+// ── FileDescriptor from raw { path, file } object ─────────────────────────────
+function makeDescriptor({ path, file }) {
     return {
-        path: fullPath,
-        get size() { return this._size ?? 0; },
+        path,
+        size: file.size,
         read(offset, length) {
-            return new Promise((res, rej) => {
-                entry.file(file => {
-                    this._size = file.size;
-                    const slice = file.slice(offset, offset + length);
-                    slice.arrayBuffer().then(ab => res(new Uint8Array(ab))).catch(rej);
-                }, rej);
-            });
+            return file.slice(offset, offset + length)
+                       .arrayBuffer().then(ab => new Uint8Array(ab));
         },
     };
 }
 
-async function collectEntries(dirEntry, prefix) {
-    const results = [];
-    await new Promise((res, rej) => {
-        const reader = dirEntry.createReader();
-        function readBatch() {
-            reader.readEntries(async entries => {
-                if (!entries.length) return res();
-                for (const e of entries) {
-                    const path = prefix ? `${prefix}/${e.name}` : e.name;
-                    if (e.isDirectory) {
-                        const sub = await collectEntries(e, path);
-                        results.push(...sub);
-                    } else {
-                        results.push(wrapEntry(e, path));
-                    }
-                }
-                readBatch();
-            }, rej);
-        }
-        readBatch();
-    });
-    return results;
+// ── SW port — provided in a second message after the main thread knows size ───
+let _swPort = null;
+const _swPortWaiters = [];
+
+function waitForSwPort() {
+    if (_swPort) return Promise.resolve(_swPort);
+    return new Promise(res => _swPortWaiters.push(res));
 }
+
+function sinkChunk(chunk) { _swPort.postMessage({ type: 'CHUNK', chunk }, [chunk.buffer]); }
+function sinkDone()       { _swPort.postMessage({ type: 'DONE' }); }
+function sinkError(msg)   { _swPort?.postMessage({ type: 'ERROR', message: msg }); }
 
 // ── Main message handler ──────────────────────────────────────────────────────
 self.onmessage = async e => {
-    const { source, onlyUpdate, swPort } = e.data;
+    const { type } = e.data;
 
-    // swPort is the MessagePort end that feeds the Service Worker stream
-    function sinkChunk(chunk) { swPort.postMessage({ type: 'CHUNK', chunk }, [chunk.buffer]); }
-    function sinkDone()       { swPort.postMessage({ type: 'DONE' }); }
-    function sinkError(msg)   { swPort.postMessage({ type: 'ERROR', message: msg }); }
+    // Phase 2: main thread sends us the SW port after learning the ZIP size
+    if (type === 'sw_port') {
+        _swPort = e.data.port;
+        for (const res of _swPortWaiters) res(_swPort);
+        _swPortWaiters.length = 0;
+        return;
+    }
+
+    // Phase 1: build request
+    const { source, dlcSources, onlyUpdate } = e.data;
 
     try {
         // ── Load manifest ─────────────────────────────────────────────────────
@@ -89,43 +82,39 @@ self.onmessage = async e => {
         let manifest;
         try {
             manifest = await fetchJSON('release/manifest.json');
-        } catch {
-            error('Could not load the release manifest. Check your internet connection.', 'no_manifest');
-            sinkError('manifest load failed');
+        } catch (err) {
+            error(`Could not load release manifest: ${err.message}`, 'no_manifest');
             return;
         }
 
-        // ── Collect file descriptors ──────────────────────────────────────────
+        // ── Build game file descriptors ───────────────────────────────────────
         log('Reading game files…');
-        self.postMessage({ type: 'status', key: 'status_reading' });
-
         let rawFiles;
         if (source.kind === 'iso') {
             rawFiles = await listIsoFiles(source.file);
         } else {
-            // source.kind === 'folder', source.entries is Array<FileSystemEntry>
-            rawFiles = [];
-            for (const entry of source.entries) {
-                if (entry.isDirectory) {
-                    const sub = await collectEntries(entry, entry.name);
-                    rawFiles.push(...sub);
-                } else {
-                    rawFiles.push(wrapEntry(entry, entry.name));
-                }
-            }
+            // source.kind === 'files', source.raw = { path, file }[]
+            rawFiles = source.raw.map(makeDescriptor);
         }
-
-        // Size-resolve folder entries (need a file() call)
-        for (const f of rawFiles) {
-            if (f._size === undefined) {
-                await new Promise(res => {
-                    // trigger a small read to populate _size
-                    f.read(0, 1).then(() => res()).catch(() => res());
-                });
-            }
-        }
-
         const files = rootAtExecutable(rawFiles);
+
+        // ── Build DLC descriptors ─────────────────────────────────────────────
+        const dlcPacks = [];
+        for (const dlcSrc of (dlcSources ?? [])) {
+            const dlcRaw = dlcSrc.raw.map(makeDescriptor);
+            const dlcFiles = rootAtExecutable(dlcRaw);
+            try {
+                // If slug/name already resolved by app.js, use them; else re-identify
+                const pack = dlcSrc.slug
+                    ? { slug: dlcSrc.slug, name: dlcSrc.name, files: dlcFiles }
+                    : await identifyDlc(dlcFiles);
+                dlcPacks.push(pack);
+                log(`DLC: ${pack.name}`);
+                self.postMessage({ type: 'dlc_identified', name: pack.name, slug: pack.slug });
+            } catch (err) {
+                log(`DLC warning: ${err.message} — skipping`);
+            }
+        }
 
         // ── Identify game ─────────────────────────────────────────────────────
         log('Identifying game…');
@@ -134,19 +123,15 @@ self.onmessage = async e => {
             identity = await identifyGame(files, manifest);
         } catch (err) {
             error(err.message ?? 'Failed to identify game.', err.code ?? 'identify');
-            sinkError(err.message);
-            return;
-        }
-
-        if (identity.titleId !== TITLE_ID) {
-            error(`Title ID mismatch: got ${identity.titleId}, expected ${TITLE_ID}.`, 'wrong_title');
-            sinkError('wrong title');
             return;
         }
 
         if (!identity.build) {
-            error('No compatible release found for this XEX version.', 'no_build');
-            sinkError('no build');
+            error(
+                `No compatible release found for XEX hash ${identity.xexHash ?? '(STFS source)'}.\n` +
+                'If you used a Package file, try an extracted folder instead.',
+                'no_build'
+            );
             return;
         }
 
@@ -154,35 +139,43 @@ self.onmessage = async e => {
         self.postMessage({ type: 'identified', xexHash, version: build.version, complete });
 
         if (!complete && !onlyUpdate) {
-            // warn but continue — user may still want to try
-            log('Warning: some game files appear to be missing.');
+            log('⚠ Some game files appear to be missing — continuing anyway.');
         }
 
-        // ── Fetch NRO ─────────────────────────────────────────────────────────
-        log(`Downloading ${build.version} NRO…`);
+        // ── Fetch NRO & assets ────────────────────────────────────────────────
+        log(`Downloading NRO (${build.version})…`);
         const nroData = await fetchBytes(programPath(build));
 
-        // ── Fetch toml + licenses ─────────────────────────────────────────────
         log('Fetching config and licenses…');
         const [tomlText, licenses] = await Promise.all([
             fetchText('release/keflings.toml'),
             fetchText('release/LICENSES.txt'),
         ]);
 
-        // ── Create package, streaming via SW port ─────────────────────────────
+        // ── Compute size, then wait for SW port ───────────────────────────────
         log('Building ZIP…');
         self.postMessage({ type: 'status', key: 'status_building' });
 
+        // createPackage calls reportSize() which triggers app.js to set up the
+        // download stream and send us the sw_port in a second message.
+        // We await waitForSwPort() inside the sink to defer streaming until ready.
+        let _sizeReported = false;
+
         await createPackage(
-            files, nroData, tomlText, licenses, onlyUpdate,
+            files, dlcPacks, nroData, tomlText, licenses, onlyUpdate,
             {
-                log(msg)      { log(msg); },
-                progress(r)   { progress(r); },
-                size(bytes)   {
+                log(msg)    { log(msg); },
+                progress(r) { progress(r); },
+                size(bytes) {
+                    _sizeReported = true;
                     self.postMessage({ type: 'size', bytes, human: formatBytes(bytes) });
                 },
             },
-            async chunk => sinkChunk(chunk),
+            async chunk => {
+                // Block until app.js sends the SW port
+                if (!_swPort) await waitForSwPort();
+                sinkChunk(chunk);
+            },
         );
 
         sinkDone();
