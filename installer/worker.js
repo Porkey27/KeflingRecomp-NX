@@ -126,13 +126,15 @@ self.onmessage = async e => {
             return;
         }
 
+        // STFS source has no XEX hash — just use the latest build from the manifest.
         if (!identity.build) {
-            error(
-                `No compatible release found for XEX hash ${identity.xexHash ?? '(STFS source)'}.\n` +
-                'If you used a Package file, try an extracted folder instead.',
-                'no_build'
-            );
-            return;
+            const builds = manifest.builds ?? [];
+            if (!builds.length) {
+                error('No builds found in release manifest.', 'no_build');
+                return;
+            }
+            identity.build = builds[builds.length - 1];
+            log(`STFS source — using latest build: ${identity.build.version}`);
         }
 
         const { build, xexHash, complete } = identity;
