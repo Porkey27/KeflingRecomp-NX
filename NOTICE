@@ -1,0 +1,18 @@
+KeflingRecomp-NX
+Copyright 2026 KeflingRecomp-NX Contributors
+
+This project is a fan port that uses static recompilation to run
+"A World of Keflings" (© NinjaBee / Microsoft Studios, 2011) on
+Nintendo Switch hardware.  You must own a legitimate copy of the game
+to use this software.
+
+This project is not affiliated with, endorsed by, or sponsored by
+NinjaBee, Microsoft, or Nintendo.
+
+Third-party components:
+  • ReXGlue SDK — © rexglue contributors, Apache-2.0
+    https://github.com/rexglue/rexglue-sdk
+  • devkitA64 / libnx — devkitPro, various licenses
+    https://devkitpro.org
+  • fmt — © Victor Zverovich, MIT
+  • xxHash — © Yann Collet, BSD 2-Clause

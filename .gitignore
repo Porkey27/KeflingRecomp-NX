@@ -1,0 +1,20 @@
+# Generated recompiler output — produce locally with rexglue recompile
+src/game/generated/
+
+# CMake build directories
+build*/
+out/
+
+# Prepared game data — must be supplied from your own copy
+game/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# macOS
+.DS_Store
+
+# Windows
+Thumbs.db

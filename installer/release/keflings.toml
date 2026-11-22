@@ -1,0 +1,20 @@
+# KeflingRecomp-NX configuration
+# Place this file at sdmc:/keflings/keflings.toml on your Switch SD card.
+
+[renderer]
+native   = true    # use built-in renderer
+msaa     = 0       # 0 = off, 2 = 2x, 4 = 4x
+anisotropic = 1    # 1 = off
+
+[timing]
+fps = 30           # 30 or 60 (60 is presentation-only smoothing; sim runs at 30)
+
+[audio]
+opus_dir = "sdmc:/keflings/game/audio_opus"   # pre-converted audio (see preparar-juego.sh)
+
+[system]
+cpu_core = 1       # Switch CPU core for the game thread (0-2)
+
+[game]
+purchased = true
+language  = "en"

@@ -1,0 +1,58 @@
+# KeflingRecomp-NX configuration
+# Place this file at sdmc:/keflings/keflings.toml on your Switch SD card.
+# Keys marked [NEEDS HW CONFIRM] have not yet been verified on real hardware.
+
+# ── Renderer ──────────────────────────────────────────────────────────────────
+[renderer]
+# Use the native Switch renderer (recommended).
+# Set to false to use the ReXGlue software fallback (slow, debug only).
+native = true
+
+# MSAA sample count. 0 = off.  Keflings is not demanding; 2x is safe.  [NEEDS HW CONFIRM]
+msaa = 0
+
+# Anisotropic filtering level (1 = off, 4/8/16). [NEEDS HW CONFIRM]
+anisotropic = 1
+
+# 24-bit depth buffer (true = more precision, slightly more VRAM)
+depth_24bit = true
+
+# GPU profiler overlay — spams stderr, leave off unless debugging GPU perf
+gpu_profiler = false
+
+# ── Frame rate ────────────────────────────────────────────────────────────────
+[timing]
+# Target frame rate.  The original Xbox 360 version runs at 30 FPS.
+# The AI simulation tick is hard-wired to 30 Hz, so setting 60 only
+# smooths presentation (render-only interpolation).  [NEEDS HW CONFIRM]
+fps = 30
+
+# ── Audio ─────────────────────────────────────────────────────────────────────
+[audio]
+# XMA2 → Opus conversion was done offline by preparar-juego.sh.
+# This path must match where the script wrote the converted streams.
+opus_dir = "sdmc:/keflings/game/audio_opus"
+
+master_volume  = 1.0
+music_volume   = 0.8
+sfx_volume     = 1.0
+
+# ── System ────────────────────────────────────────────────────────────────────
+[system]
+# CPU core affinity for the main game thread (0–2 on Switch; 3 = system).
+cpu_core = 1
+
+# Override GPU clock in MHz.  Leave at 0 to let the system (or sys-clk) decide.
+# If sys-clk is installed, prefer using its profile instead.
+gpu_clock_mhz = 0
+
+# Log level: trace | debug | info | warn | error
+log_level = "info"
+
+# ── Game ──────────────────────────────────────────────────────────────────────
+[game]
+# Marks the game as purchased, disabling the trial-mode nag. [NEEDS HW CONFIRM]
+purchased = true
+
+# Language for UI text.  Keflings ships: en, fr, de, es, it, ja, ko, pt, ru, zh
+language = "en"
