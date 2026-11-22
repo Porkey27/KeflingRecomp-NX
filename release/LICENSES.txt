@@ -1,0 +1,38 @@
+KeflingRecomp-NX
+================
+Copyright (C) 2024 KeflingRecomp-NX contributors
+License: GNU General Public License v3.0 or later
+https://github.com/Porkey27/KeflingRecomp-NX
+
+ReXGlue SDK
+===========
+Copyright (C) rexglue contributors
+License: GNU General Public License v3.0 or later
+https://github.com/rexglue/rexglue-sdk
+
+libnx
+=====
+Copyright (C) switchbrew contributors
+License: ISC License
+https://github.com/switchbrew/libnx
+
+devkitA64 / devkitPro
+=====================
+Copyright (C) devkitPro contributors
+https://devkitpro.org
+
+fmt
+===
+Copyright (c) 2012-present Victor Zverovich
+License: MIT
+https://github.com/fmtlib/fmt
+
+xxHash
+======
+Copyright (C) 2012-2021 Yann Collet
+License: BSD 2-Clause
+https://github.com/Cyan4973/xxHash
+
+--------------------------------------------------------------------------------
+A World of Keflings is copyright (C) NinjaBee / Microsoft. This software is an
+independent interoperability tool. You must own a legitimate copy of the game.
