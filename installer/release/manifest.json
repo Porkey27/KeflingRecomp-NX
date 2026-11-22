@@ -1,4 +1,9 @@
 {
-  "_comment": "KeflingRecomp-NX release manifest. Add a build entry here for each supported XEX version.",
-  "builds": []
+  "builds": [
+    {
+      "version": "0.1.0-prerelease",
+      "xexHash": "c49b1bbaa86246a8c248c9562ef619a03bcd81aff21e0159656f5ffa0cfa7ae0",
+      "nroHash": null
+    }
+  ]
 }
