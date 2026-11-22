@@ -278,7 +278,7 @@ function triggerDownload(filename, totalSize) {
 
 // ── Build ─────────────────────────────────────────────────────────────────────
 async function startBuild(onlyUpdate) {
-    if (!_identified || !_gameFiles) return;
+    if (!_identified || !_rawGameFiles) return;
 
     const btnCreate = $('create');
     const btnUpdate = $('update');
